@@ -51,6 +51,29 @@
 #      the actual error shown, instead of pretending nothing happened. This
 #      is almost certainly why the Kharej (foreign) side looked "stopped"
 #      and never came up after install/config.
+#  12) install_core(): /proc/cpuinfo-based CPU detection (avx512f/modern/
+#      old-cpu) isn't always right on every VPS/VM — some hosts report CPU
+#      flags the guest can't actually use. WaterWall's own binary detects
+#      this correctly at startup and exits with "This Waterwall binary was
+#      built for a newer x86-64 CPU than this machine/OS exposes", but the
+#      old script never looked at that output, so it just crash-looped
+#      forever. Install now smoke-tests the binary right after installing it
+#      and automatically re-downloads the old-cpu build if that exact message
+#      shows up, instead of leaving a tunnel that can never start.
+#  13) config_halfduplex_tunnel(), IRAN server side: the previous config used
+#      TWO TcpListener nodes (23..tunnel_port-1 and tunnel_port+1..65535)
+#      both set to "next": "header". WaterWall v1.46.96 rejects this outright
+#      at startup:
+#        FATAL Node Map Failure: Node (users_inbound_high) wanted to bind to
+#        (header) which is already bounded by users_inbound_low
+#      — a node can only be the "next" target of ONE other node, so two
+#      listeners can't both feed the same downstream node. There's no way to
+#      carve a hole out of the middle of a single-range listener, so this is
+#      now a SINGLE "users_inbound" listener covering 23..tunnel_port-1, and
+#      the tunnel port's default moved from 443 to 65432 (a high, normally
+#      unused port) so that one range still covers virtually every real port
+#      users would connect on. This only matters on the IRAN side; the Kharej
+#      (client) config was already a single linear chain with no fan-in.
 # ============================================================================
 
 RED='\033[0;31m'
@@ -217,39 +240,20 @@ init() {
     esac
 }
 
-install_core() {
-    echo -e "${CYAN}Detecting system architecture and fetching WaterWall ${WW_VERSION}...${NC}"
-    cd "$INSTALL_DIR" || exit 1
-    mkdir -p "$INSTALL_DIR/log" "$INSTALL_DIR/libs"
+# FIX (main install bug, kept as its own function for #12 below): the old
+# script only ever tried 1-2 hardcoded asset filenames per arch, so if
+# upstream ever renamed/reordered release assets the download (and therefore
+# the whole install) would silently fail. We now ask the GitHub API for the
+# REAL list of asset names/urls on this tag and pick the best match for the
+# given CPU/arch; the old hardcoded names are kept only as a last-resort
+# fallback. Every downloaded zip is integrity-checked with `unzip -t`, then
+# extracted into $INSTALL_DIR and the binary normalized to ./Waterwall.
+# Returns 0 and leaves an executable $INSTALL_DIR/Waterwall in place on
+# success, 1 otherwise.
+fetch_and_extract_waterwall() {
+    local arch_tag="$1"
+    local cpu_tag="$2"
 
-    local arch arch_tag cpu_tag
-    arch=$(uname -m)
-
-    if [[ "$arch" == "x86_64" || "$arch" == "amd64" ]]; then
-        arch_tag="x64"
-        if grep -qi "avx512f" /proc/cpuinfo 2>/dev/null; then
-            cpu_tag="avx512f"
-        elif ! grep -qi "avx2" /proc/cpuinfo 2>/dev/null; then
-            cpu_tag="old-cpu"
-        else
-            cpu_tag="modern"
-        fi
-    elif [[ "$arch" == "aarch64" || "$arch" == "arm64" ]]; then
-        arch_tag="arm64"
-        cpu_tag="modern"
-    else
-        echo -e "${RED}Unsupported architecture: $arch${NC}"
-        sleep 2
-        init
-        return
-    fi
-
-    # FIX (main install bug): the old script only ever tried 1-2 hardcoded
-    # asset filenames per arch, so if upstream ever renamed/reordered release
-    # assets the download (and therefore the whole install) would silently
-    # fail. We now ask the GitHub API for the REAL list of asset names/urls
-    # on this tag and pick the best match for the detected CPU/arch; the old
-    # hardcoded names are kept only as a last-resort fallback.
     local -a candidate_urls=()
     local api_json
     api_json=$(curl -sSL --max-time 10 "https://api.github.com/repos/radkesvat/WaterWall/releases/tags/${WW_VERSION}" 2>/dev/null)
@@ -303,6 +307,7 @@ install_core() {
     fi
 
     local downloaded=false url
+    cd "$INSTALL_DIR" || return 1
     for url in "${candidate_urls[@]}"; do
         echo -e "${YELLOW}Trying: ${url}${NC}"
         rm -f Waterwall.zip
@@ -318,10 +323,7 @@ install_core() {
 
     if [[ "$downloaded" != true ]]; then
         rm -f Waterwall.zip
-        echo -e "${RED}Failed to download a working WaterWall ${WW_VERSION} archive for this system (${arch}). Check the server's internet/DNS, or that release still publishes a matching Linux asset.${NC}"
-        sleep 3
-        init
-        return
+        return 1
     fi
 
     systemctl stop waterwall.service 2>/dev/null
@@ -338,6 +340,43 @@ install_core() {
         fi
     fi
     chmod +x "$INSTALL_DIR/Waterwall"
+
+    [[ -x "$INSTALL_DIR/Waterwall" ]]
+}
+
+install_core() {
+    echo -e "${CYAN}Detecting system architecture and fetching WaterWall ${WW_VERSION}...${NC}"
+    cd "$INSTALL_DIR" || exit 1
+    mkdir -p "$INSTALL_DIR/log" "$INSTALL_DIR/libs"
+
+    local arch arch_tag cpu_tag
+    arch=$(uname -m)
+
+    if [[ "$arch" == "x86_64" || "$arch" == "amd64" ]]; then
+        arch_tag="x64"
+        if grep -qi "avx512f" /proc/cpuinfo 2>/dev/null; then
+            cpu_tag="avx512f"
+        elif ! grep -qi "avx2" /proc/cpuinfo 2>/dev/null; then
+            cpu_tag="old-cpu"
+        else
+            cpu_tag="modern"
+        fi
+    elif [[ "$arch" == "aarch64" || "$arch" == "arm64" ]]; then
+        arch_tag="arm64"
+        cpu_tag="modern"
+    else
+        echo -e "${RED}Unsupported architecture: $arch${NC}"
+        sleep 2
+        init
+        return
+    fi
+
+    if ! fetch_and_extract_waterwall "$arch_tag" "$cpu_tag"; then
+        echo -e "${RED}Failed to download a working WaterWall ${WW_VERSION} archive for this system (${arch}). Check the server's internet/DNS, or that release still publishes a matching Linux asset.${NC}"
+        sleep 3
+        init
+        return
+    fi
 
     if [[ ! -x "$INSTALL_DIR/Waterwall" ]]; then
         echo -e "${RED}Download succeeded but no Waterwall executable was found after extraction. Aborting.${NC}"
@@ -387,6 +426,39 @@ install_core() {
     ]
 }
 EOL
+
+    # FIX (#12): /proc/cpuinfo flags (used above to pick avx512f/modern/
+    # old-cpu) aren't always trustworthy — some VPS/VM hosts report flags the
+    # guest can't actually use, so the wrong build can get picked even though
+    # detection "succeeded". WaterWall's own binary checks this properly at
+    # startup and exits immediately with "This Waterwall binary was built for
+    # a newer x86-64 CPU than this machine/OS exposes" if so — which, before
+    # this fix, just crash-looped forever under systemd (restart counter
+    # climbing indefinitely) with nothing telling the user why. We smoke-test
+    # the binary for exactly that message right after install and, if seen,
+    # automatically re-download the old-cpu build instead.
+    local smoke_output
+    smoke_output=$(cd "$INSTALL_DIR" && timeout 3 ./Waterwall --verbose 2>&1)
+    if echo "$smoke_output" | grep -qi "built for a newer"; then
+        if [[ "$cpu_tag" != "old-cpu" ]]; then
+            echo -e "${YELLOW}This CPU/VM doesn't actually support the WaterWall build that was just installed. Re-downloading the compatible 'old-cpu' build instead...${NC}"
+            cpu_tag="old-cpu"
+            if ! fetch_and_extract_waterwall "$arch_tag" "$cpu_tag"; then
+                echo -e "${RED}Failed to download the old-cpu WaterWall ${WW_VERSION} archive. Check the server's internet/DNS.${NC}"
+                sleep 3
+                init
+                return
+            fi
+            smoke_output=$(cd "$INSTALL_DIR" && timeout 3 ./Waterwall --verbose 2>&1)
+            if echo "$smoke_output" | grep -qi "built for a newer"; then
+                echo -e "${RED}Even the old-cpu WaterWall build reports a CPU incompatibility on this machine. This usually points at the host CPU itself (or a restrictive hypervisor), not something this script can fix automatically — building WaterWall from source with advanced CPU instructions disabled is the next step.${NC}"
+                sleep 4
+                init
+                return
+            fi
+            echo -e "${GREEN}old-cpu build runs correctly on this machine.${NC}"
+        fi
+    fi
 
     setup_systemd_service
     if [[ -f "$INSTALL_DIR/dev-ir.json" ]]; then
@@ -469,28 +541,38 @@ config_halfduplex_tunnel() {
                 echo -e "${RED}Please enter a valid IPv4 address (e.g. 203.0.113.10).${NC}"
             done
 
-            # FIX: tunnel_port feeds port_before=tunnel_port-1 and
-            # port_after=tunnel_port+1 as the two multi-port TcpListener
-            # ranges below. A tunnel_port outside 24..65534 makes one of
-            # those ranges invalid (e.g. [23, 22]), which WaterWall refuses
-            # to start with — previously unvalidated.
+            # FIX (#13): this used to split the public port range into TWO
+            # TcpListener nodes (23..tunnel_port-1 and tunnel_port+1..65535),
+            # both pointing "next" at the same "header" node. On this
+            # WaterWall version that is a hard error at startup:
+            #   FATAL Node Map Failure: Node (users_inbound_high) wanted to
+            #   bind to (header) which is already bounded by users_inbound_low
+            # i.e. a node can only be the "next" target of ONE other node, so
+            # two listeners can't both feed the same downstream node. There's
+            # no way to keep a hole in the middle of a single-range listener,
+            # so instead we now use exactly ONE "users" listener covering
+            # 23..tunnel_port-1, and tunnel_port defaults to a high, normally
+            # unused port (65432) so that single range still covers virtually
+            # every real port (80, 443, 2083, 8080, 8443, ...). Only picking a
+            # LOW custom tunnel_port here would meaningfully shrink the usable
+            # range, so the recommendation below steers away from that.
             local tunnel_port=""
             while true; do
-                read -rp "Enter Tunnel Port between Iran & Kharej [default: 443]: " tunnel_port
-                tunnel_port=${tunnel_port:-443}
-                if [[ "$tunnel_port" =~ ^[0-9]+$ ]] && (( tunnel_port >= 24 && tunnel_port <= 65534 )); then
+                read -rp "Enter Tunnel Port between Iran & Kharej (pick a high, normally-unused port — it's an internal link, not a user-facing one) [default: 65432]: " tunnel_port
+                tunnel_port=${tunnel_port:-65432}
+                if [[ "$tunnel_port" =~ ^[0-9]+$ ]] && (( tunnel_port >= 24 && tunnel_port <= 65535 )); then
                     break
                 fi
-                echo -e "${RED}Port must be a whole number between 24 and 65534.${NC}"
+                echo -e "${RED}Port must be a whole number between 24 and 65535.${NC}"
             done
 
             # FIX (#9): Reality password is fixed to "1234" on both sides and
             # no longer prompted for, so Iran/Kharej can't drift out of sync.
             local tunnel_pass="1234"
 
-            # Build port ranges excluding tunnel_port so TcpListener never collides with kharej_inbound
+            # Build the single port range excluding tunnel_port so the users
+            # listener never collides with kharej_inbound (see FIX #13 above).
             local port_before=$((tunnel_port - 1))
-            local port_after=$((tunnel_port + 1))
 
             # FIX: escape free-text input before it lands inside JSON strings
             # (a password or SNI containing a quote/backslash used to corrupt
@@ -507,21 +589,11 @@ config_halfduplex_tunnel() {
     "core-minimum-version": 0,
     "nodes": [
         {
-            "name": "users_inbound_low",
+            "name": "users_inbound",
             "type": "TcpListener",
             "settings": {
                 "address": "0.0.0.0",
                 "port": [23, $port_before],
-                "nodelay": true
-            },
-            "next": "header"
-        },
-        {
-            "name": "users_inbound_high",
-            "type": "TcpListener",
-            "settings": {
-                "address": "0.0.0.0",
-                "port": [$port_after, 65535],
                 "nodelay": true
             },
             "next": "header"
@@ -610,21 +682,11 @@ EOL
     "core-minimum-version": 0,
     "nodes": [
         {
-            "name": "users_inbound_low",
+            "name": "users_inbound",
             "type": "TcpListener",
             "settings": {
                 "address": "0.0.0.0",
                 "port": [23, $port_before],
-                "nodelay": true
-            },
-            "next": "header"
-        },
-        {
-            "name": "users_inbound_high",
-            "type": "TcpListener",
-            "settings": {
-                "address": "0.0.0.0",
-                "port": [$port_after, 65535],
                 "nodelay": true
             },
             "next": "header"
@@ -741,10 +803,13 @@ EOL
                 echo -e "${RED}Please enter a valid IPv4 address (e.g. 203.0.113.10).${NC}"
             done
 
+            # FIX (#13): must match whatever the IRAN side was configured
+            # with; default is now 65432, not 443 — see the note on the IRAN
+            # side's prompt for why.
             local tunnel_port=""
             while true; do
-                read -rp "Enter Tunnel Port between Iran & Kharej [default: 443]: " tunnel_port
-                tunnel_port=${tunnel_port:-443}
+                read -rp "Enter Tunnel Port between Iran & Kharej (must match the IRAN side) [default: 65432]: " tunnel_port
+                tunnel_port=${tunnel_port:-65432}
                 if [[ "$tunnel_port" =~ ^[0-9]+$ ]] && (( tunnel_port >= 1 && tunnel_port <= 65535 )); then
                     break
                 fi
