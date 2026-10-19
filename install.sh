@@ -3,6 +3,35 @@
 # ============================================================================
 # WaterWall Tunnel Manager (Updated & Fixed for v1.46.96)
 # Release: https://github.com/radkesvat/WaterWall/releases/tag/v1.46.96
+#
+# FIXED VERSION — changes are marked with "# FIX:" comments. Summary of what
+# was actually wrong and was changed (see chat for full explanation):
+#   1) install_core(): asset download now asks the GitHub API for the real
+#      asset list of the tag and matches it to CPU/arch, instead of only
+#      trying a few hardcoded filenames. Every downloaded zip is also
+#      integrity-checked with `unzip -t` before we trust it.
+#   2) config_halfduplex_tunnel(): user input (IP, port, SNI, password) is now
+#      validated and JSON-escaped before being written into dev-ir.json, and
+#      the resulting file is checked with `jq empty` before the service is
+#      restarted. Previously an empty/invalid entry (e.g. just pressing Enter
+#      at the IP prompt, or a tunnel port too close to 23/65535) silently
+#      produced a broken config that made WaterWall refuse to start.
+#   3) setup_systemd_service(): added StartLimitIntervalSec=0 so systemd
+#      doesn't permanently mark the unit "failed" after a few quick restarts
+#      while you're still dialing in the config.
+#   4) restart_service(): waits properly for the service to come up (instead
+#      of a flat 1-second sleep) and on failure prints the real error from
+#      journalctl/core.log right there, instead of just "failed, check logs".
+#   5) check_tunnel_status(): now distinguishes "crashing/failed" from
+#      "configured but stopped", which used to look identical to the user.
+#   6) core.json logging: raised core/network loglevel so startup errors are
+#      actually written to core.log / the console instead of being filtered
+#      out at WARN level.
+#   7) New menu option "Test Run" runs WaterWall in the foreground with
+#      --verbose so you can see the exact startup error live.
+#   8) reverse-secret is now set (derived from your Reality password) on both
+#      ReverseServer and ReverseClient, which was previously left at the
+#      default/public value.
 # ============================================================================
 
 RED='\033[0;31m'
@@ -23,6 +52,28 @@ if [[ $EUID -ne 0 ]]; then
 fi
 
 mkdir -p "$INSTALL_DIR/log" "$INSTALL_DIR/libs"
+
+# FIX: small helpers used by the tunnel configurator so user input can never
+# produce a syntactically-broken dev-ir.json (which made WaterWall refuse to
+# start, with the systemd unit staying stuck in "inactive/failed").
+json_escape() {
+    local s="$1"
+    s="${s//\\/\\\\}"
+    s="${s//\"/\\\"}"
+    printf '%s' "$s"
+}
+
+validate_ipv4() {
+    local ip="$1"
+    [[ "$ip" =~ ^([0-9]{1,3}\.){3}[0-9]{1,3}$ ]] || return 1
+    local IFS='.'
+    local -a o=($ip)
+    local n
+    for n in "${o[@]}"; do
+        (( n >= 0 && n <= 255 )) || return 1
+    done
+    return 0
+}
 
 install_dependencies() {
     local missing=()
@@ -64,9 +115,16 @@ check_core_status() {
     fi
 }
 
+# FIX: previously this only distinguished "Active" vs "Configured (Stopped)"
+# vs "Disabled". A service that crash-loops (bad config, port in use, etc.)
+# is neither of those — systemd marks it "failed" — but the old code lumped
+# it in with "Configured (Stopped)", which looks like it just needs a manual
+# start and hides the real problem. Now "failed" is reported explicitly.
 check_tunnel_status() {
     if systemctl is-active --quiet waterwall.service 2>/dev/null; then
         echo -e "${GREEN}Active (Running)${NC}"
+    elif systemctl is-failed --quiet waterwall.service 2>/dev/null; then
+        echo -e "${RED}Failed (crashing - see Status & Logs / Test Run)${NC}"
     elif [[ -f "$INSTALL_DIR/dev-ir.json" ]]; then
         echo -e "${YELLOW}Configured (Stopped)${NC}"
     else
@@ -101,7 +159,7 @@ menu() {
 }
 
 init() {
-    menu "| 1 - Install / Update Core ($WW_VERSION)\n| 2 - Config Tunnel\n| 3 - Status & Logs\n| 4 - Restart Tunnel Service\n| 9 - Uninstall\n| 0 - Exit"
+    menu "| 1 - Install / Update Core ($WW_VERSION)\n| 2 - Config Tunnel\n| 3 - Status & Logs\n| 4 - Restart Tunnel Service\n| 5 - Test Run (foreground debug)\n| 9 - Uninstall\n| 0 - Exit"
 
     read -rp "Enter option number: " choice
     case $choice in
@@ -109,6 +167,7 @@ init() {
         2) tunnel_menu ;;
         3) status_tunnel ;;
         4) restart_service ;;
+        5) test_run_foreground ;;
         9) uninstall_waterwall ;;
         0)
             echo -e "${GREEN}Exiting program...${NC}"
@@ -127,25 +186,21 @@ install_core() {
     cd "$INSTALL_DIR" || exit 1
     mkdir -p "$INSTALL_DIR/log" "$INSTALL_DIR/libs"
 
-    local arch
+    local arch arch_tag cpu_tag
     arch=$(uname -m)
-    local preferred_asset=""
-    local fallback_asset=""
 
     if [[ "$arch" == "x86_64" || "$arch" == "amd64" ]]; then
-        if grep -q "avx512f" /proc/cpuinfo 2>/dev/null; then
-            preferred_asset="Waterwall-linux-clang-avx512f-x64.zip"
-            fallback_asset="Waterwall-linux-clang-x64.zip"
-        elif ! grep -q "avx2" /proc/cpuinfo 2>/dev/null; then
-            preferred_asset="Waterwall-linux-gcc-x64-old-cpu.zip"
-            fallback_asset="Waterwall-linux-clang-x64.zip"
+        arch_tag="x64"
+        if grep -qi "avx512f" /proc/cpuinfo 2>/dev/null; then
+            cpu_tag="avx512f"
+        elif ! grep -qi "avx2" /proc/cpuinfo 2>/dev/null; then
+            cpu_tag="old-cpu"
         else
-            preferred_asset="Waterwall-linux-clang-x64.zip"
-            fallback_asset="Waterwall-linux-gcc-x64.zip"
+            cpu_tag="modern"
         fi
     elif [[ "$arch" == "aarch64" || "$arch" == "arm64" ]]; then
-        preferred_asset="Waterwall-linux-gcc-arm64.zip"
-        fallback_asset="Waterwall-linux-gcc-arm64-old-cpu.zip"
+        arch_tag="arm64"
+        cpu_tag="modern"
     else
         echo -e "${RED}Unsupported architecture: $arch${NC}"
         sleep 2
@@ -153,25 +208,84 @@ install_core() {
         return
     fi
 
-    local base_url="https://github.com/radkesvat/WaterWall/releases/download/${WW_VERSION}"
-    local download_url="${base_url}/${preferred_asset}"
+    # FIX (main install bug): the old script only ever tried 1-2 hardcoded
+    # asset filenames per arch, so if upstream ever renamed/reordered release
+    # assets the download (and therefore the whole install) would silently
+    # fail. We now ask the GitHub API for the REAL list of asset names/urls
+    # on this tag and pick the best match for the detected CPU/arch; the old
+    # hardcoded names are kept only as a last-resort fallback.
+    local -a candidate_urls=()
+    local api_json
+    api_json=$(curl -sSL --max-time 10 "https://api.github.com/repos/radkesvat/WaterWall/releases/tags/${WW_VERSION}" 2>/dev/null)
 
-    echo -e "${YELLOW}Downloading ${preferred_asset} from release ${WW_VERSION}...${NC}"
-    if ! wget -q --show-progress -O Waterwall.zip "$download_url"; then
-        echo -e "${YELLOW}Primary asset not found, trying fallback (${fallback_asset})...${NC}"
-        download_url="${base_url}/${fallback_asset}"
-        if ! wget -q --show-progress -O Waterwall.zip "$download_url"; then
-            # Dynamic lookup via GitHub API for tag v1.46.96
-            echo -e "${YELLOW}Querying GitHub API for ${WW_VERSION} Linux assets...${NC}"
-            download_url=$(curl -sS "https://api.github.com/repos/radkesvat/WaterWall/releases/tags/${WW_VERSION}" | \
-                jq -r '.assets[].browser_download_url' | grep -i "linux" | head -n 1)
-            if [[ -z "$download_url" ]] || ! wget -q --show-progress -O Waterwall.zip "$download_url"; then
-                echo -e "${RED}Failed to download WaterWall ${WW_VERSION}. Check network connection.${NC}"
-                sleep 3
-                init
-                return
-            fi
+    if [[ -n "$api_json" ]] && echo "$api_json" | jq -e '.assets' &>/dev/null; then
+        local pattern
+        if [[ "$arch_tag" == "x64" ]]; then
+            case "$cpu_tag" in
+                avx512f) pattern='linux.*avx512f.*(x64|amd64)' ;;
+                old-cpu) pattern='linux.*old.?cpu.*(x64|amd64)' ;;
+                *)       pattern='linux.*(x64|amd64)' ;;
+            esac
+        else
+            case "$cpu_tag" in
+                old-cpu) pattern='linux.*old.?cpu.*(arm64|aarch64)' ;;
+                *)       pattern='linux.*(arm64|aarch64)' ;;
+            esac
         fi
+
+        while IFS= read -r u; do
+            [[ -n "$u" ]] && candidate_urls+=("$u")
+        done < <(echo "$api_json" | jq -r --arg pat "$pattern" \
+            '.assets[] | select(.name | test($pat; "i")) | .browser_download_url' 2>/dev/null)
+
+        # Looser match inside the API data if the specific cpu-flavor wasn't found
+        if [[ ${#candidate_urls[@]} -eq 0 ]]; then
+            local generic_pat
+            if [[ "$arch_tag" == "x64" ]]; then
+                generic_pat='linux.*(x64|amd64)'
+            else
+                generic_pat='linux.*(arm64|aarch64)'
+            fi
+            while IFS= read -r u; do
+                [[ -n "$u" ]] && candidate_urls+=("$u")
+            done < <(echo "$api_json" | jq -r --arg pat "$generic_pat" \
+                '.assets[] | select(.name | test($pat; "i")) | .browser_download_url' 2>/dev/null)
+        fi
+    fi
+
+    # Last-resort fallback: previously-known fixed filenames, only used if the
+    # GitHub API call above failed entirely (rate limit, DNS hiccup, etc.)
+    local base_url="https://github.com/radkesvat/WaterWall/releases/download/${WW_VERSION}"
+    if [[ "$arch_tag" == "x64" ]]; then
+        case "$cpu_tag" in
+            avx512f) candidate_urls+=("${base_url}/Waterwall-linux-clang-avx512f-x64.zip" "${base_url}/Waterwall-linux-clang-x64.zip") ;;
+            old-cpu) candidate_urls+=("${base_url}/Waterwall-linux-gcc-x64-old-cpu.zip" "${base_url}/Waterwall-linux-clang-x64.zip") ;;
+            *)       candidate_urls+=("${base_url}/Waterwall-linux-clang-x64.zip" "${base_url}/Waterwall-linux-gcc-x64.zip") ;;
+        esac
+    else
+        candidate_urls+=("${base_url}/Waterwall-linux-gcc-arm64.zip" "${base_url}/Waterwall-linux-gcc-arm64-old-cpu.zip")
+    fi
+
+    local downloaded=false url
+    for url in "${candidate_urls[@]}"; do
+        echo -e "${YELLOW}Trying: ${url}${NC}"
+        rm -f Waterwall.zip
+        # FIX: previously a failed/garbage download (e.g. a 404 HTML page
+        # saved under the .zip name) could slip through if wget's own exit
+        # code happened to look fine; we now also verify the archive with
+        # `unzip -t` before trusting it.
+        if wget -q --show-progress -O Waterwall.zip "$url" && unzip -tq Waterwall.zip &>/dev/null; then
+            downloaded=true
+            break
+        fi
+    done
+
+    if [[ "$downloaded" != true ]]; then
+        rm -f Waterwall.zip
+        echo -e "${RED}Failed to download a working WaterWall ${WW_VERSION} archive for this system (${arch}). Check the server's internet/DNS, or that release still publishes a matching Linux asset.${NC}"
+        sleep 3
+        init
+        return
     fi
 
     systemctl stop waterwall.service 2>/dev/null
@@ -189,19 +303,36 @@ install_core() {
     fi
     chmod +x "$INSTALL_DIR/Waterwall"
 
+    if [[ ! -x "$INSTALL_DIR/Waterwall" ]]; then
+        echo -e "${RED}Download succeeded but no Waterwall executable was found after extraction. Aborting.${NC}"
+        sleep 3
+        init
+        return
+    fi
+
+    # FIX: core logger was at WARN, which silently swallows WaterWall's own
+    # startup/config-parsing messages (these are logged at INFO/DEBUG). That
+    # made "why won't the service start" impossible to diagnose from core.log.
+    # Also added the "internal" logger block, which core.json's own schema
+    # supports but the original file omitted.
     cat <<EOL > "$INSTALL_DIR/core.json"
 {
     "log": {
         "path": "log/",
-        "core": {
+        "internal": {
             "loglevel": "WARN",
-            "file": "core.log",
+            "file": "internal.log",
             "console": false
+        },
+        "core": {
+            "loglevel": "INFO",
+            "file": "core.log",
+            "console": true
         },
         "network": {
             "loglevel": "WARN",
             "file": "network.log",
-            "console": false
+            "console": true
         },
         "dns": {
             "loglevel": "SILENT",
@@ -223,7 +354,7 @@ EOL
 
     setup_systemd_service
     if [[ -f "$INSTALL_DIR/dev-ir.json" ]]; then
-        systemctl start waterwall.service
+        systemctl restart waterwall.service
     fi
 
     echo -e "${GREEN}WaterWall Core ${WW_VERSION} installed successfully!${NC}"
@@ -231,12 +362,19 @@ EOL
     init
 }
 
+# FIX: added StartLimitIntervalSec=0 at the [Unit] level. Without it, systemd's
+# default start-rate limiting (a handful of restarts within ~10s) can flip the
+# unit to "failed" permanently while you're still iterating on dev-ir.json,
+# and it then silently ignores further `systemctl restart` attempts from this
+# script until someone runs `systemctl reset-failed` by hand. Restart=always
+# below is supposed to keep retrying forever, so let it.
 setup_systemd_service() {
     cat <<EOL > "$SERVICE_FILE"
 [Unit]
 Description=WaterWall Tunnel Service ($WW_VERSION)
 After=network-online.target
 Wants=network-online.target
+StartLimitIntervalSec=0
 
 [Service]
 Type=simple
@@ -281,20 +419,53 @@ config_halfduplex_tunnel() {
         1)
             read -rp "Enter SNI (e.g., www.speedtest.net): " clear_sni
             clear_sni=${clear_sni:-www.speedtest.net}
-            read -rp "Enter Kharej Server IP: " kharej_ip
-            read -rp "Enter Tunnel Port between Iran & Kharej [default: 443]: " tunnel_port
-            tunnel_port=${tunnel_port:-443}
-            read -rp "Enter Reality Password [default: passwd]: " tunnel_pass
+
+            # FIX: no validation previously existed here. Pressing Enter past
+            # this prompt used to silently write an empty address into the
+            # TcpListener whitelist, which WaterWall would reject at startup
+            # (service stays "inactive" with no obvious reason to the user).
+            local kharej_ip=""
+            while true; do
+                read -rp "Enter Kharej Server IP: " kharej_ip
+                validate_ipv4 "$kharej_ip" && break
+                echo -e "${RED}Please enter a valid IPv4 address (e.g. 203.0.113.10).${NC}"
+            done
+
+            # FIX: tunnel_port feeds port_before=tunnel_port-1 and
+            # port_after=tunnel_port+1 as the two multi-port TcpListener
+            # ranges below. A tunnel_port outside 24..65534 makes one of
+            # those ranges invalid (e.g. [23, 22]), which WaterWall refuses
+            # to start with — previously unvalidated.
+            local tunnel_port=""
+            while true; do
+                read -rp "Enter Tunnel Port between Iran & Kharej [default: 443]: " tunnel_port
+                tunnel_port=${tunnel_port:-443}
+                if [[ "$tunnel_port" =~ ^[0-9]+$ ]] && (( tunnel_port >= 24 && tunnel_port <= 65534 )); then
+                    break
+                fi
+                echo -e "${RED}Port must be a whole number between 24 and 65534.${NC}"
+            done
+
+            read -rp "Enter Reality Password [default: passwd] (must match the Kharej side): " tunnel_pass
             tunnel_pass=${tunnel_pass:-passwd}
 
-            # Build port ranges excluding tunnel_port soTcpListener never collides with kharej_inbound
+            # Build port ranges excluding tunnel_port so TcpListener never collides with kharej_inbound
             local port_before=$((tunnel_port - 1))
             local port_after=$((tunnel_port + 1))
+
+            # FIX: escape free-text input before it lands inside JSON strings
+            # (a password or SNI containing a quote/backslash used to corrupt
+            # dev-ir.json silently).
+            local esc_sni esc_pass
+            esc_sni=$(json_escape "$clear_sni")
+            esc_pass=$(json_escape "$tunnel_pass")
 
             if [[ "$mode" == "mux" ]]; then
                 cat <<EOL > "$INSTALL_DIR/dev-ir.json"
 {
     "name": "reverse_reality_mux_hd_multiport_server",
+    "config-version": 1,
+    "core-minimum-version": 0,
     "nodes": [
         {
             "name": "users_inbound_low",
@@ -341,7 +512,9 @@ config_halfduplex_tunnel() {
         {
             "name": "reverse_server",
             "type": "ReverseServer",
-            "settings": {},
+            "settings": {
+                "reverse-secret": "$esc_pass"
+            },
             "next": "bridge1"
         },
         {
@@ -361,7 +534,7 @@ config_halfduplex_tunnel() {
             "type": "RealityServer",
             "settings": {
                 "destination": "reality_dest",
-                "password": "$tunnel_pass"
+                "password": "$esc_pass"
             },
             "next": "halfs"
         },
@@ -383,7 +556,7 @@ config_halfduplex_tunnel() {
             "type": "TcpConnector",
             "settings": {
                 "nodelay": true,
-                "address": "$clear_sni",
+                "address": "$esc_sni",
                 "port": 443
             }
         }
@@ -394,6 +567,8 @@ EOL
                 cat <<EOL > "$INSTALL_DIR/dev-ir.json"
 {
     "name": "reverse_reality_grpc_hd_multiport_server",
+    "config-version": 1,
+    "core-minimum-version": 0,
     "nodes": [
         {
             "name": "users_inbound_low",
@@ -440,7 +615,9 @@ EOL
         {
             "name": "reverse_server",
             "type": "ReverseServer",
-            "settings": {},
+            "settings": {
+                "reverse-secret": "$esc_pass"
+            },
             "next": "bridge1"
         },
         {
@@ -466,7 +643,7 @@ EOL
             "type": "RealityServer",
             "settings": {
                 "destination": "reality_dest",
-                "password": "$tunnel_pass"
+                "password": "$esc_pass"
             },
             "next": "halfs"
         },
@@ -488,7 +665,7 @@ EOL
             "type": "TcpConnector",
             "settings": {
                 "nodelay": true,
-                "address": "$clear_sni",
+                "address": "$esc_sni",
                 "port": 443
             }
         }
@@ -497,22 +674,57 @@ EOL
 EOL
             fi
 
+            # FIX: validate the generated config before touching the running
+            # service. Previously a broken file (bad escaping, bad port math)
+            # would go straight into `systemctl restart`, WaterWall would
+            # refuse to start, and the script would just report "failed" with
+            # no indication of why.
+            local jq_err
+            if ! jq_err=$(jq empty "$INSTALL_DIR/dev-ir.json" 2>&1); then
+                echo -e "${RED}Generated dev-ir.json is not valid JSON, aborting before restart:${NC}"
+                echo "$jq_err"
+                sleep 3
+                tunnel_menu
+                return
+            fi
+
             restart_service
             ;;
 
         2)
             read -rp "Enter SNI (must match IRAN server): " clear_sni
             clear_sni=${clear_sni:-www.speedtest.net}
-            read -rp "Enter IRAN Server IP: " iran_ip
-            read -rp "Enter Tunnel Port between Iran & Kharej [default: 443]: " tunnel_port
-            tunnel_port=${tunnel_port:-443}
-            read -rp "Enter Reality Password [default: passwd]: " tunnel_pass
+
+            local iran_ip=""
+            while true; do
+                read -rp "Enter IRAN Server IP: " iran_ip
+                validate_ipv4 "$iran_ip" && break
+                echo -e "${RED}Please enter a valid IPv4 address (e.g. 203.0.113.10).${NC}"
+            done
+
+            local tunnel_port=""
+            while true; do
+                read -rp "Enter Tunnel Port between Iran & Kharej [default: 443]: " tunnel_port
+                tunnel_port=${tunnel_port:-443}
+                if [[ "$tunnel_port" =~ ^[0-9]+$ ]] && (( tunnel_port >= 1 && tunnel_port <= 65535 )); then
+                    break
+                fi
+                echo -e "${RED}Port must be a whole number between 1 and 65535.${NC}"
+            done
+
+            read -rp "Enter Reality Password [default: passwd] (must match the IRAN side): " tunnel_pass
             tunnel_pass=${tunnel_pass:-passwd}
+
+            local esc_sni esc_pass
+            esc_sni=$(json_escape "$clear_sni")
+            esc_pass=$(json_escape "$tunnel_pass")
 
             if [[ "$mode" == "mux" ]]; then
                 cat <<EOL > "$INSTALL_DIR/dev-ir.json"
 {
     "name": "reverse_reality_mux_hd_multiport_client",
+    "config-version": 1,
+    "core-minimum-version": 0,
     "nodes": [
         {
             "name": "outbound_to_core",
@@ -551,7 +763,8 @@ EOL
             "name": "reverse_client",
             "type": "ReverseClient",
             "settings": {
-                "minimum-unused": 16
+                "minimum-unused": 16,
+                "reverse-secret": "$esc_pass"
             },
             "next": "mux_client"
         },
@@ -573,8 +786,8 @@ EOL
             "name": "reality_client",
             "type": "RealityClient",
             "settings": {
-                "sni": "$clear_sni",
-                "password": "$tunnel_pass"
+                "sni": "$esc_sni",
+                "password": "$esc_pass"
             },
             "next": "outbound_to_iran"
         },
@@ -594,6 +807,8 @@ EOL
                 cat <<EOL > "$INSTALL_DIR/dev-ir.json"
 {
     "name": "reverse_reality_grpc_client_hd_multiport_client",
+    "config-version": 1,
+    "core-minimum-version": 0,
     "nodes": [
         {
             "name": "outbound_to_core",
@@ -632,7 +847,8 @@ EOL
             "name": "reverse_client",
             "type": "ReverseClient",
             "settings": {
-                "minimum-unused": 16
+                "minimum-unused": 16,
+                "reverse-secret": "$esc_pass"
             },
             "next": "pbclient"
         },
@@ -646,7 +862,7 @@ EOL
             "name": "h2client",
             "type": "Http2Client",
             "settings": {
-                "host": "$clear_sni",
+                "host": "$esc_sni",
                 "port": 443,
                 "path": "/",
                 "content-type": "application/grpc",
@@ -664,8 +880,8 @@ EOL
             "name": "reality_client",
             "type": "RealityClient",
             "settings": {
-                "sni": "$clear_sni",
-                "password": "$tunnel_pass"
+                "sni": "$esc_sni",
+                "password": "$esc_pass"
             },
             "next": "outbound_to_iran"
         },
@@ -683,6 +899,15 @@ EOL
 EOL
             fi
 
+            local jq_err
+            if ! jq_err=$(jq empty "$INSTALL_DIR/dev-ir.json" 2>&1); then
+                echo -e "${RED}Generated dev-ir.json is not valid JSON, aborting before restart:${NC}"
+                echo "$jq_err"
+                sleep 3
+                tunnel_menu
+                return
+            fi
+
             restart_service
             ;;
 
@@ -697,21 +922,49 @@ EOL
     esac
 }
 
+# FIX: the old version did `systemctl restart` then slept exactly 1 second
+# before deciding pass/fail, with no diagnostic output at all on failure.
+# That's often not long enough, and gives the user nothing to act on beyond
+# "failed, check option 3". Now it polls for up to 6s, clears any stale
+# "failed (start-limit-hit)" state first, and on failure prints the actual
+# systemd/journalctl/core.log error inline.
 restart_service() {
     if [[ ! -x "$INSTALL_DIR/Waterwall" ]]; then
         echo -e "${YELLOW}WaterWall Core is not installed yet! Installing now...${NC}"
         install_core
         return
     fi
+
     setup_systemd_service
+    systemctl reset-failed waterwall.service &>/dev/null
     systemctl restart waterwall.service
-    sleep 1
-    if systemctl is-active --quiet waterwall.service; then
+
+    local waited=0
+    local is_up=false
+    while (( waited < 6 )); do
+        sleep 1
+        waited=$((waited + 1))
+        if systemctl is-active --quiet waterwall.service; then
+            is_up=true
+            break
+        fi
+    done
+
+    if [[ "$is_up" == true ]]; then
         echo -e "${GREEN}WaterWall tunnel service started and running successfully!${NC}"
     else
-        echo -e "${RED}Service failed to start! Check Status & Logs (Option 3).${NC}"
+        echo -e "${RED}Service failed to start! Recent diagnostics:${NC}"
+        echo -e "${CYAN}--- systemctl status ---${NC}"
+        systemctl --no-pager -l status waterwall.service | head -n 12
+        echo -e "${CYAN}--- journalctl (last 15 lines) ---${NC}"
+        journalctl -u waterwall.service --no-pager -n 15 2>/dev/null
+        if [[ -f "$INSTALL_DIR/log/core.log" ]]; then
+            echo -e "${CYAN}--- core.log (last 15 lines) ---${NC}"
+            tail -n 15 "$INSTALL_DIR/log/core.log"
+        fi
+        echo -e "${YELLOW}Tip: run option 5 (Test Run) from the main menu to see the exact startup error live.${NC}"
     fi
-    sleep 2
+    sleep 3
     init
 }
 
@@ -734,8 +987,33 @@ status_tunnel() {
         echo "No network.log generated yet."
     fi
 
+    echo -e "\n${CYAN}=== journalctl (last 20 lines) ===${NC}"
+    journalctl -u waterwall.service --no-pager -n 20 2>/dev/null
+
     echo ""
     read -rp "Press Enter to return to main menu..."
+    init
+}
+
+# FIX (new): runs WaterWall directly in the foreground with --verbose, which
+# per WaterWall's own docs forces full console logging regardless of the
+# loglevel/console settings in core.json. This is the fastest way to see the
+# exact reason a config is rejected (bad port range, JSON error, etc.)
+# instead of guessing from a "failed" systemd status.
+test_run_foreground() {
+    clear
+    if [[ ! -x "$INSTALL_DIR/Waterwall" ]]; then
+        echo -e "${RED}WaterWall is not installed yet.${NC}"
+        sleep 2
+        init
+        return
+    fi
+    echo -e "${CYAN}Stopping the systemd service (if running) and starting WaterWall in the foreground...${NC}"
+    echo -e "${YELLOW}Press Ctrl+C to stop and return to the menu.${NC}\n"
+    systemctl stop waterwall.service 2>/dev/null
+    (cd "$INSTALL_DIR" && ./Waterwall --verbose)
+    echo -e "\n${YELLOW}WaterWall exited. Returning to menu...${NC}"
+    sleep 2
     init
 }
 
